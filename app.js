@@ -501,6 +501,8 @@ class GlyphPhysics {
     this.gravityUnitY = 1;
     this.gravityStrength = 1;
     this.gravityActive = false;
+    this.smoothedGravityX = 0;
+    this.smoothedGravityY = 0.5;
     this.appliedGravityUnitX = 0;
     this.appliedGravityUnitY = 1;
     this.appliedGravityStrength = 1;
@@ -566,21 +568,32 @@ class GlyphPhysics {
 
     if (typeof DeviceOrientationEvent.requestPermission === "function") {
       // iOS: the permission prompt must come from a user gesture, so the
-      // first touch on the page asks once. Denial silently keeps the
-      // default straight-down gravity.
+      // first tap on the page asks. touchend/pointerup carry user
+      // activation (pointerdown does not reliably). A rejected promise
+      // means the gesture lacked activation — re-arm and retry on the next
+      // tap; only a real granted/denied answer latches the flag.
+      const disarm = () => {
+        window.removeEventListener("touchend", request);
+        this.stage.removeEventListener("pointerup", request);
+      };
+      const arm = () => {
+        window.addEventListener("touchend", request, { passive: true });
+        this.stage.addEventListener("pointerup", request, { passive: true });
+      };
       const request = () => {
         if (this.motionPermissionRequested) return;
         this.motionPermissionRequested = true;
-        window.removeEventListener("touchend", request);
-        this.stage.removeEventListener("pointerdown", request);
+        disarm();
         DeviceOrientationEvent.requestPermission()
           .then((state) => {
             if (state === "granted") attach();
           })
-          .catch(() => {});
+          .catch(() => {
+            this.motionPermissionRequested = false;
+            arm();
+          });
       };
-      window.addEventListener("touchend", request, { passive: true });
-      this.stage.addEventListener("pointerdown", request, { passive: true });
+      arm();
     } else {
       attach();
     }
@@ -600,66 +613,76 @@ class GlyphPhysics {
     const portraitX = Math.sin(gammaRad) * Math.cos(betaRad);
     const portraitY = Math.sin(betaRad);
 
-    // Rotate into the current screen orientation. angle=90 corresponds to
-    // the device turned clockwise (content rotated counterclockwise), which
-    // maps page vectors by a +angle rotation.
+    // Rotate into the current screen orientation. Per the Screen Orientation
+    // spec, angle is how far the screen is rotated COUNTER-clockwise from
+    // its natural orientation, so device-natural page vectors map into the
+    // current page frame by a -angle rotation.
     const orientationDegrees = screen.orientation && typeof screen.orientation.angle === "number"
       ? screen.orientation.angle
       : Number(window.orientation) || 0;
     const orientation = orientationDegrees * (Math.PI / 180);
     const cos = Math.cos(orientation);
     const sin = Math.sin(orientation);
-    const planarX = portraitX * cos - portraitY * sin;
-    const planarY = portraitX * sin + portraitY * cos;
+    const planarX = portraitX * cos + portraitY * sin;
+    const planarY = -portraitX * sin + portraitY * cos;
 
-    // A flat phone has no in-plane gravity: fade strength out instead of
-    // chasing an unstable direction. Full strength from ~30 degrees of tilt.
-    const planarMagnitude = Math.hypot(planarX, planarY);
-    const targetStrength = clamp(planarMagnitude / 0.5, 0, 1);
-    let targetUnitX = this.gravityUnitX;
-    let targetUnitY = this.gravityUnitY;
-    if (planarMagnitude > 0.08) {
-      targetUnitX = planarX / planarMagnitude;
-      targetUnitY = planarY / planarMagnitude;
-    }
-
+    // Low-pass the raw planar vector, not the unit vector: a flip through
+    // flat then passes through zero (strength fades out and back in) with
+    // no antipodal fixed point. A flat phone has no in-plane gravity, so
+    // strength fades out instead of chasing an unstable direction; full
+    // strength from ~30 degrees of tilt.
     const blend = 0.25;
-    let unitX = this.gravityUnitX + (targetUnitX - this.gravityUnitX) * blend;
-    let unitY = this.gravityUnitY + (targetUnitY - this.gravityUnitY) * blend;
-    const norm = Math.hypot(unitX, unitY);
-    if (norm > 0.0001) {
-      unitX /= norm;
-      unitY /= norm;
-    } else {
-      unitX = targetUnitX;
-      unitY = targetUnitY;
+    this.smoothedGravityX += (planarX - this.smoothedGravityX) * blend;
+    this.smoothedGravityY += (planarY - this.smoothedGravityY) * blend;
+    const magnitude = Math.hypot(this.smoothedGravityX, this.smoothedGravityY);
+    const strength = clamp(magnitude / 0.5, 0, 1);
+    let unitX = this.gravityUnitX;
+    let unitY = this.gravityUnitY;
+    if (magnitude > 0.04) {
+      unitX = this.smoothedGravityX / magnitude;
+      unitY = this.smoothedGravityY / magnitude;
     }
+
+    // Sensor-bearing laptops and near-upright phones stay on the exact
+    // default behavior; only a deliberate tilt away from straight-down
+    // (~8 degrees) or toward flat switches the sim into tilt mode.
+    if (!this.gravityActive) {
+      if (unitY > 0.99 && strength > 0.75) return;
+      this.gravityActive = true;
+      this.fullReleaseSince = 0;
+    }
+
     this.gravityUnitX = unitX;
     this.gravityUnitY = unitY;
-    this.gravityStrength += (targetStrength - this.gravityStrength) * blend;
-    this.gravityActive = true;
+    this.gravityStrength = strength;
 
-    // A meaningful swing in direction or strength has to wake sleeping
-    // glyphs and restart the loop — a settled pile must not stay glued
-    // mid-air when the floor effectively moves.
+    // A meaningful swing has to wake sleeping glyphs and restart the loop —
+    // a settled pile must not stay glued mid-air when the floor effectively
+    // moves. Comparing strength-scaled vectors makes direction noise
+    // self-suppressing as strength fades near flat.
     if (this.mode !== "falling") return;
-    const alignment = unitX * this.appliedGravityUnitX + unitY * this.appliedGravityUnitY;
-    const strengthShift = Math.abs(this.gravityStrength - this.appliedGravityStrength);
-    if (alignment < 0.985 || strengthShift > 0.12) {
-      this.appliedGravityUnitX = unitX;
-      this.appliedGravityUnitY = unitY;
-      this.appliedGravityStrength = this.gravityStrength;
-      const particles = this.particles;
-      for (let i = 0; i < particles.length; i += 1) {
-        const particle = particles[i];
-        if (!particle.released || !particle.sleeping) continue;
-        particle.sleeping = false;
-        particle.sleepTimer = 0;
-        particle.energyAverage = 0;
-      }
-      this.allSleepingFrames = 0;
-      this.startLoop();
+    const deltaX = unitX * strength - this.appliedGravityUnitX * this.appliedGravityStrength;
+    const deltaY = unitY * strength - this.appliedGravityUnitY * this.appliedGravityStrength;
+    if (Math.hypot(deltaX, deltaY) <= 0.15) return;
+
+    // Tilting while the hero is scrolled out of view shouldn't grind an
+    // invisible pile; the un-updated applied vector lets the first
+    // in-view event catch up and wake everything then.
+    if (this.hero.getBoundingClientRect().bottom <= 0) return;
+
+    this.appliedGravityUnitX = unitX;
+    this.appliedGravityUnitY = unitY;
+    this.appliedGravityStrength = strength;
+    const particles = this.particles;
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released || !particle.sleeping) continue;
+      particle.sleeping = false;
+      particle.sleepTimer = 0;
+      particle.energyAverage = 0;
     }
+    this.allSleepingFrames = 0;
+    this.startLoop();
   }
 
   handleResize() {
@@ -1288,7 +1311,20 @@ class GlyphPhysics {
       this.allSleepingFrames = 0;
     }
 
-    if (this.mode === "returning" || (this.mode === "falling" && (moving || this.allSleepingFrames < 2))) {
+    // A pending tilt-mode deck reveal must outlive a fully sleeping pile:
+    // the 2.5s grace deadline in maybeActivateProjectDeck needs a driver,
+    // so the loop keeps ticking (bounded by the grace window) until the
+    // deck activates.
+    const revealPending = this.gravityActive
+      && !projectDeckReady
+      && this.mode === "falling"
+      && this.fullReleaseSince > 0
+      && this.progress >= this.projectRevealProgress;
+
+    if (
+      this.mode === "returning"
+      || (this.mode === "falling" && (moving || this.allSleepingFrames < 2 || revealPending))
+    ) {
       this.raf = requestAnimationFrame(this.tick);
     }
   }
@@ -1724,7 +1760,11 @@ class GlyphPhysics {
     for (let i = 0; i < count; i += 1) {
       const particle = active[i];
       particle.supported = reached[i] === 1;
-      if (particle.sleeping && !particle.supported) {
+      // Weightless glyphs (near-flat phone) are allowed to sleep without
+      // support, so losing support must not wake them either — otherwise
+      // the sleep/wake pair ping-pongs every substep and the loop never
+      // idles. At default strength 1 this is the original rule exactly.
+      if (particle.sleeping && !particle.supported && this.gravityStrength >= 0.3) {
         particle.sleeping = false;
         particle.sleepTimer = 0;
         particle.energyAverage = 0;
