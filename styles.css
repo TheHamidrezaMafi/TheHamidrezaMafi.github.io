@@ -209,7 +209,6 @@ body.intro-skipped .terminal-line {
   min-width: 1ch;
   color: inherit;
   transition: opacity 60ms linear;
-  will-change: opacity;
 }
 
 .char.released {
@@ -263,7 +262,6 @@ body.intro-skipped .terminal-line {
   text-shadow: 0 0 0.55em currentColor;
   transform: translate(-50%, -50%);
   transition: none;
-  will-change: color, opacity;
 }
 
 .fire-cell.released {

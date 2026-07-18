@@ -151,6 +151,8 @@ function renderTerminal() {
 }
 
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+const FIXED_STEP = 1 / 120;
+const GRID_CELL = 18;
 const lerp = (start, end, amount) => start + (end - start) * amount;
 const smoothstep = (edge0, edge1, value) => {
   const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
@@ -406,9 +408,11 @@ class AsciiCampfire {
   }
 
   freeze() {
+    // The DOM already shows the last advanceHeat frame (advance and render
+    // always run as a pair), so no re-render is needed here — one would only
+    // dirty ~480 elements right before measure() reads their geometry.
     this.frozen = true;
     this.stop();
-    this.render();
   }
 
   resume() {
@@ -433,7 +437,6 @@ class GlyphPhysics {
     this.canvas = canvasElement;
     this.restoreButton = restoreElement;
     this.campfire = campfire;
-    this.glyphRoots = [sourceElement, campfire?.element].filter(Boolean);
     this.ctx = this.canvas.getContext("2d", { alpha: true });
 
     this.mode = "intact";
@@ -458,6 +461,38 @@ class GlyphPhysics {
     this.projectHideProgress = 0.27;
     this.reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+    // Released-particle list, maintained incrementally so the solver never
+    // re-filters per substep.
+    this.activeParticles = [];
+
+    // Reusable integer-keyed spatial grid (counting-sort layout) and support
+    // graph buffers — the solver allocates nothing per pass.
+    this.gridCellStart = null;
+    this.gridCursor = null;
+    this.gridEntries = null;
+    this.gridCellOf = null;
+    this.gridW = 0;
+    this.gridH = 0;
+    this.gridCells = 0;
+    this.adjacencyHead = null;
+    this.edgeTo = null;
+    this.edgeNext = null;
+    this.reachedFlags = null;
+    this.supportQueue = null;
+
+    // Pre-rendered glyph sprites keyed by font|color|glyph; rebuilt on measure.
+    this.spriteAtlas = new Map();
+    this.spriteScratch = null;
+
+    // Terminal glyph geometry cached off the hot path (idle pre-measure), so
+    // activation inside the scroll handler avoids ~700 rect reads.
+    this.terminalGeometry = null;
+    this.resizePending = false;
+    this.idleMeasureTimer = null;
+    this.createdAt = performance.now();
+    this.maxHeightQuery = window.matchMedia("(max-height: 600px)");
+    this.lastMaxHeightMatch = this.maxHeightQuery.matches;
+
     this.tick = this.tick.bind(this);
     this.handleScroll = this.handleScroll.bind(this);
     this.handleResize = this.handleResize.bind(this);
@@ -469,9 +504,13 @@ class GlyphPhysics {
   async init() {
     if (document.fonts?.ready) await document.fonts.ready;
     await new Promise((resolve) => requestAnimationFrame(resolve));
-    this.measure();
+    // No glyph harvest at startup: it would run mid entrance animation and be
+    // discarded at activation anyway. Glyphs are pre-measured during idle time
+    // once the intro settles; activate() falls back to a full sweep if needed.
+    this.measureViewport();
     this.bindEvents();
     this.handleScroll();
+    this.scheduleIdleMeasure();
   }
 
   bindEvents() {
@@ -502,45 +541,216 @@ class GlyphPhysics {
   }
 
   handleResize() {
+    // Mark immediately (not in the debounce) so an activation racing a real
+    // resize distrusts the terminal geometry cache and re-reads the DOM.
+    this.resizePending = true;
     window.clearTimeout(this.resizeTimer);
-    this.resizeTimer = window.setTimeout(() => this.measure(), 120);
+    this.resizeTimer = window.setTimeout(() => this.onResizeSettled(), 120);
   }
 
-  measure() {
-    const previousWidth = this.width;
-    const previousHeight = this.height;
+  onResizeSettled() {
     const stageRect = this.stage.getBoundingClientRect();
+    const width = Math.max(1, stageRect.width);
+    const height = Math.max(1, stageRect.height);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const compactHeight = this.maxHeightQuery.matches;
+
+    // Mobile URL-bar show/hide fires resize without changing the 100svh stage
+    // or any glyph geometry. Skipping the re-measure keeps a settled pile
+    // asleep and avoids reallocating the canvas mid-interaction.
+    if (
+      width === this.width
+      && height === this.height
+      && dpr === this.dpr
+      && compactHeight === this.lastMaxHeightMatch
+    ) {
+      this.resizePending = false;
+      return;
+    }
+
+    this.terminalGeometry = null;
+    if (this.mode === "intact") {
+      // Nothing is simulating; resize the canvas and let idle time re-measure.
+      this.measureViewport(stageRect);
+      this.resizePending = false;
+      this.scheduleIdleMeasure();
+    } else {
+      this.measure();
+      this.resizePending = false;
+    }
+  }
+
+  introSettled() {
+    return document.body.classList.contains("intro-skipped")
+      || performance.now() - this.createdAt > 2900;
+  }
+
+  scheduleIdleMeasure() {
+    if (this.reducedMotion) return;
+    window.clearTimeout(this.idleMeasureTimer);
+
+    const attempt = () => {
+      try {
+        if (this.mode !== "intact" || this.resizePending || this.terminalGeometry) return;
+        if (!this.introSettled()) {
+          this.scheduleIdleMeasure();
+          return;
+        }
+        this.readTerminalGeometry(this.stage.getBoundingClientRect());
+      } catch {
+        // Activation falls back to the full synchronous sweep.
+      }
+    };
+
+    const delay = this.introSettled() ? 80 : 3000;
+    this.idleMeasureTimer = window.setTimeout(() => {
+      if ("requestIdleCallback" in window) {
+        window.requestIdleCallback(attempt, { timeout: 1500 });
+      } else {
+        window.setTimeout(attempt, 60);
+      }
+    }, delay);
+  }
+
+  measureViewport(stageRect = this.stage.getBoundingClientRect()) {
     this.width = Math.max(1, stageRect.width);
     this.height = Math.max(1, stageRect.height);
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.floorPadding = this.width < 700 ? 11 : 15;
+    this.lastMaxHeightMatch = this.maxHeightQuery.matches;
 
     this.canvas.width = Math.round(this.width * this.dpr);
     this.canvas.height = Math.round(this.height * this.dpr);
     this.canvas.style.width = `${this.width}px`;
     this.canvas.style.height = `${this.height}px`;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.spriteAtlas.clear();
+    return stageRect;
+  }
+
+  readTerminalGeometry(stageRect) {
+    const entries = [];
+    for (const element of this.source.querySelectorAll("[data-glyph]")) {
+      const rect = element.getBoundingClientRect();
+      if (!(rect.width > 0 && rect.height > 0)) continue;
+      entries.push({
+        element,
+        homeX: rect.left - stageRect.left + rect.width / 2,
+        homeY: rect.top - stageRect.top + rect.height / 2,
+        glyphWidth: rect.width,
+      });
+    }
+
+    // Only geometry read after the entrance animation settled may be cached —
+    // an early sweep would bake the transient translateY(4px) into homeY.
+    if (this.introSettled()) {
+      this.terminalGeometry = {
+        width: Math.max(1, stageRect.width),
+        height: Math.max(1, stageRect.height),
+        compactHeight: this.maxHeightQuery.matches,
+        entries,
+      };
+    }
+    return entries;
+  }
+
+  readFireGeometry(stageRect) {
+    const campfire = this.campfire;
+    if (!campfire) return [];
+    const fireRect = campfire.element.getBoundingClientRect();
+    if (!(fireRect.width > 0 && fireRect.height > 0)) return [];
+
+    // Fire cells sit at known percentages of the campfire box with
+    // translate(-50%, -50%) centering, so their centers are pure arithmetic —
+    // no per-cell rect reads. One sample per kind supplies the 1ch width.
+    const entries = [];
+    const lastColumn = campfire.columns - 1;
+    const lastRow = campfire.rows - 1;
+    let cellWidth = 0;
+    let sparkWidth = 0;
+
+    for (const cell of campfire.cells) {
+      const element = cell.element;
+      if (!element.dataset.glyph) continue;
+      if (!cellWidth) cellWidth = element.getBoundingClientRect().width;
+      entries.push({
+        element,
+        homeX: fireRect.left - stageRect.left + (cell.x / lastColumn) * fireRect.width,
+        homeY: fireRect.top - stageRect.top + (cell.y / lastRow) * fireRect.height,
+        glyphWidth: cellWidth,
+      });
+    }
+
+    for (const spark of campfire.sparks) {
+      const element = spark.element;
+      if (!element.dataset.glyph) continue;
+      const left = Number.parseFloat(element.style.left);
+      const top = Number.parseFloat(element.style.top);
+      if (!Number.isFinite(left) || !Number.isFinite(top)) continue;
+      if (!sparkWidth) sparkWidth = element.getBoundingClientRect().width;
+      entries.push({
+        element,
+        homeX: fireRect.left - stageRect.left + (left / 100) * fireRect.width,
+        homeY: fireRect.top - stageRect.top + (top / 100) * fireRect.height,
+        glyphWidth: sparkWidth,
+      });
+    }
+
+    return entries;
+  }
+
+  measure() {
+    const previousWidth = this.width;
+    const previousHeight = this.height;
+
+    // ---- Read phase: every DOM read runs against one clean layout, before
+    // this function performs any DOM or canvas write. ----
+    const stageRect = this.stage.getBoundingClientRect();
+    const width = Math.max(1, stageRect.width);
+    const height = Math.max(1, stageRect.height);
+
+    const cacheValid = this.terminalGeometry
+      && !this.resizePending
+      && this.terminalGeometry.width === width
+      && this.terminalGeometry.height === height
+      && this.terminalGeometry.compactHeight === this.maxHeightQuery.matches;
+    const terminalEntries = cacheValid
+      ? this.terminalGeometry.entries
+      : this.readTerminalGeometry(stageRect);
+    const fireEntries = this.readFireGeometry(stageRect);
+    const nextCardObstacles = projectDeckReady ? this.readCardObstacles() : [];
+
+    // Computed style is resolved once per unique class, not once per glyph:
+    // tone colors and fonts are class-level constants. Alpha is pinned to 1
+    // for terminal glyphs (the blinking cursor and mid-fall .released spans
+    // otherwise capture a transient 0 and vanish from the canvas).
+    const styleCache = new Map();
+    const styleFor = (element) => {
+      let entry = styleCache.get(element.className);
+      if (!entry) {
+        const style = getComputedStyle(element);
+        entry = {
+          color: style.color,
+          font: `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`,
+          fontSize: Number.parseFloat(style.fontSize) || 14,
+        };
+        styleCache.set(element.className, entry);
+      }
+      return entry;
+    };
 
     const priorByElement = new Map(this.particles.map((particle) => [particle.element, particle]));
-    const visibleCharacters = this.glyphRoots.flatMap((root) => [...root.querySelectorAll("[data-glyph]")]).filter((element) => {
-      const rect = element.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && getComputedStyle(element).display !== "none";
-    });
-
     const nextParticles = [];
-    const scaleX = previousWidth > 1 ? this.width / previousWidth : 1;
-    const scaleY = previousHeight > 1 ? this.height / previousHeight : 1;
+    const scaleX = previousWidth > 1 ? width / previousWidth : 1;
+    const scaleY = previousHeight > 1 ? height / previousHeight : 1;
 
-    visibleCharacters.forEach((element, index) => {
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      const homeX = rect.left - stageRect.left + rect.width / 2;
-      const homeY = rect.top - stageRect.top + rect.height / 2;
-      const font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    const harvest = ({ element, homeX, homeY, glyphWidth }) => {
+      const style = styleFor(element);
       const kind = element.dataset.particleKind || "terminal";
       const radiusScale = Number.parseFloat(element.dataset.radiusScale) || 1;
       const radius = kind === "fire"
-        ? clamp(rect.width * 0.57 * radiusScale, 2.2, 5.1)
-        : clamp(rect.width * 0.57 * radiusScale, 3.8, 7.2);
+        ? clamp(glyphWidth * 0.57 * radiusScale, 2.2, 5.1)
+        : clamp(glyphWidth * 0.57 * radiusScale, 3.8, 7.2);
       const existing = priorByElement.get(element);
 
       const particle = existing || {
@@ -573,17 +783,37 @@ class GlyphPhysics {
       particle.glyph = element.dataset.glyph;
       particle.kind = kind;
       particle.radius = radius;
-      particle.color = style.color;
-      particle.alpha = Number.isFinite(Number.parseFloat(style.opacity)) ? Number.parseFloat(style.opacity) : 1;
-      particle.font = font;
-      particle.fontSize = Number.parseFloat(style.fontSize) || 14;
-      particle.index = index;
+      if (kind === "fire") {
+        // The campfire wrote these inline for the frozen frame; reading them
+        // back avoids any computed-style resolution.
+        particle.color = element.style.color;
+        const inlineAlpha = Number.parseFloat(element.style.getPropertyValue("--fire-alpha"));
+        particle.alpha = Number.isFinite(inlineAlpha) ? inlineAlpha : 1;
+      } else {
+        particle.color = style.color;
+        particle.alpha = 1;
+      }
+      particle.font = style.font;
+      particle.fontSize = style.fontSize;
+      particle.index = nextParticles.length;
+      particle.sprite = null;
+      particle.previousX = particle.x;
+      particle.previousY = particle.y;
+      particle.previousAngle = particle.angle;
       nextParticles.push(particle);
-    });
+    };
 
-    const yValues = nextParticles.map((particle) => particle.homeY);
-    const minY = Math.min(...yValues, 0);
-    const maxY = Math.max(...yValues, minY + 1);
+    terminalEntries.forEach(harvest);
+    fireEntries.forEach(harvest);
+
+    let minY = 0;
+    let maxY = 1;
+    for (let i = 0; i < nextParticles.length; i += 1) {
+      const homeY = nextParticles[i].homeY;
+      if (homeY < minY) minY = homeY;
+      if (homeY > maxY) maxY = homeY;
+    }
+    maxY = Math.max(maxY, minY + 1);
 
     nextParticles.forEach((particle, index) => {
       const verticalOrder = (particle.homeY - minY) / Math.max(1, maxY - minY);
@@ -601,10 +831,13 @@ class GlyphPhysics {
     });
 
     this.particles = nextParticles;
-    this.floorPadding = this.width < 700 ? 11 : 15;
+    this.activeParticles = nextParticles.filter((particle) => particle.released);
+
+    // ---- Write phase: canvas sizing and dimension state, after all reads. ----
+    this.measureViewport(stageRect);
 
     if (projectDeckReady) {
-      this.measureCardObstacles();
+      this.cardObstacles = nextCardObstacles;
       this.projectParticlesOutOfCards();
     }
 
@@ -691,6 +924,9 @@ class GlyphPhysics {
         particle.supported = false;
         particle.x = particle.homeX;
         particle.y = particle.homeY;
+        particle.previousX = particle.x;
+        particle.previousY = particle.y;
+        particle.previousAngle = particle.angle;
         if (particle.kind === "fire") {
           particle.vx = lerp(-24, 24, seeded(particle.index, 4));
           particle.vy = lerp(2, 25, seeded(particle.index, 6));
@@ -705,7 +941,12 @@ class GlyphPhysics {
       }
     });
 
-    if (releasedAny) this.startLoop();
+    if (releasedAny) {
+      // Rebuilding via filter keeps particle-array index order, which the
+      // sequential PBD solver depends on.
+      this.activeParticles = this.particles.filter((particle) => particle.released);
+      this.startLoop();
+    }
   }
 
   readCardObstacles() {
@@ -732,7 +973,7 @@ class GlyphPhysics {
 
   maybeActivateProjectDeck(startLoop) {
     if (projectDeckReady || this.mode !== "falling" || this.progress < this.projectRevealProgress) return;
-    const active = this.particles.filter((particle) => particle.released);
+    const active = this.activeParticles;
     if (!active.length || active.length !== this.particles.length) return;
 
     const potentialObstacles = this.readCardObstacles();
@@ -781,6 +1022,7 @@ class GlyphPhysics {
       particle.angularVelocity *= 0.5;
       particle.previousX = particle.x;
       particle.previousY = particle.y;
+      particle.previousAngle = particle.angle;
     });
   }
 
@@ -844,15 +1086,19 @@ class GlyphPhysics {
     const elapsed = Math.min((now - this.lastTime) / 1000, 0.05);
     this.lastTime = now;
     this.accumulator = Math.min(this.accumulator + elapsed, 1 / 15);
-    const fixedStep = 1 / 120;
     let steps = 0;
 
-    while (this.accumulator >= fixedStep && steps < 6) {
-      if (this.mode === "falling") this.stepFalling(fixedStep);
-      if (this.mode === "returning") this.stepReturning(fixedStep);
-      this.accumulator -= fixedStep;
+    // Cap 3, not 6: after a hitch, one 6-substep catch-up frame usually blows
+    // its own deadline and decays into several more. Bleeding the excess keeps
+    // at most one substep of leftover (what draw()'s interpolation expects) at
+    // the cost of brief slow-motion during frames that were already dropped.
+    while (this.accumulator >= FIXED_STEP && steps < 3) {
+      if (this.mode === "falling") this.stepFalling(FIXED_STEP);
+      if (this.mode === "returning") this.stepReturning(FIXED_STEP);
+      this.accumulator -= FIXED_STEP;
       steps += 1;
     }
+    this.accumulator = Math.min(this.accumulator, FIXED_STEP);
 
     this.maybeActivateProjectDeck(false);
 
@@ -863,7 +1109,14 @@ class GlyphPhysics {
       return;
     }
 
-    const moving = this.particles.some((particle) => particle.released && (!particle.sleeping || particle.dragging));
+    let moving = false;
+    for (let i = 0; i < this.particles.length; i += 1) {
+      const particle = this.particles[i];
+      if (particle.released && (!particle.sleeping || particle.dragging)) {
+        moving = true;
+        break;
+      }
+    }
     if (this.mode === "falling" && !moving) {
       this.allSleepingFrames += 1;
     } else {
@@ -880,18 +1133,21 @@ class GlyphPhysics {
     const floor = this.height - this.floorPadding;
     const linearAirRetention = Math.exp(-0.2 * dt);
     const angularAirRetention = Math.exp(-0.28 * dt);
+    const particles = this.particles;
 
-    this.particles.forEach((particle) => {
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      // Flag resets and the previous-position snapshot are unconditional:
+      // particles woken mid-solve reconstruct velocity from this snapshot.
       particle.contactCount = 0;
       particle.grounded = false;
       particle.supported = false;
       particle.obstacleSupported = false;
       particle.previousX = particle.x;
       particle.previousY = particle.y;
-    });
+      particle.previousAngle = particle.angle;
 
-    this.particles.forEach((particle) => {
-      if (!particle.released || particle.dragging || particle.sleeping) return;
+      if (!particle.released || particle.dragging || particle.sleeping) continue;
 
       particle.vy += gravity * dt;
       particle.vx *= linearAirRetention;
@@ -901,7 +1157,7 @@ class GlyphPhysics {
       particle.x += particle.vx * dt;
       particle.y += particle.vy * dt;
       particle.angle += particle.angularVelocity * dt;
-    });
+    }
 
     this.resolveCollisions(floor);
     this.reconcileConstraintVelocities(dt);
@@ -910,16 +1166,19 @@ class GlyphPhysics {
   }
 
   reconcileConstraintVelocities(dt) {
-    this.particles.forEach((particle) => {
-      if (!particle.released || particle.dragging || particle.sleeping) return;
+    const particles = this.particles;
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released || particle.dragging || particle.sleeping) continue;
       particle.vx = (particle.x - particle.previousX) / dt;
       particle.vy = (particle.y - particle.previousY) / dt;
-    });
+    }
   }
 
-  solveBounds(floor) {
-    this.particles.forEach((particle) => {
-      if (!particle.released || particle.dragging) return;
+  solveBounds(active, floor) {
+    for (let i = 0; i < active.length; i += 1) {
+      const particle = active[i];
+      if (particle.dragging) continue;
 
       if (particle.x - particle.radius < 0) {
         particle.x = particle.radius;
@@ -936,14 +1195,16 @@ class GlyphPhysics {
       if (particle.y - particle.radius < 0) {
         particle.y = particle.radius;
       }
-    });
+    }
   }
 
   resolveCardParticle(particle, activationProjection = false) {
     let collided = false;
     const slop = 0.025;
+    const obstacles = this.cardObstacles;
 
-    this.cardObstacles.forEach((obstacle) => {
+    for (let i = 0; i < obstacles.length; i += 1) {
+      const obstacle = obstacles[i];
       const closestX = clamp(particle.x, obstacle.left, obstacle.right);
       const closestY = clamp(particle.y, obstacle.top, obstacle.bottom);
       let dx = particle.x - closestX;
@@ -951,7 +1212,7 @@ class GlyphPhysics {
       const distanceSquared = dx * dx + dy * dy;
       const radiusSquared = particle.radius * particle.radius;
 
-      if (distanceSquared >= radiusSquared) return;
+      if (distanceSquared >= radiusSquared) continue;
 
       let nx = 0;
       let ny = 0;
@@ -994,139 +1255,264 @@ class GlyphPhysics {
       // Static card contacts are intentionally almost inelastic. The PBD
       // velocity reconstruction removes inward speed; this trims residual spin.
       if (!particle.dragging && !activationProjection) particle.angularVelocity *= 0.985;
-    });
+    }
 
     return collided;
   }
 
   solveCardCollisions(active) {
     if (!this.cardObstacles.length) return;
-    active.forEach((particle) => this.resolveCardParticle(particle));
+    for (let i = 0; i < active.length; i += 1) {
+      this.resolveCardParticle(active[i]);
+    }
   }
 
   isSupportedByCard(particle) {
+    const obstacles = this.cardObstacles;
+    if (!obstacles.length) return false;
     const tolerance = 0.72;
-    return this.cardObstacles.some((obstacle) => (
-      particle.x + particle.radius > obstacle.left - tolerance
-      && particle.x - particle.radius < obstacle.right + tolerance
-      && particle.y <= obstacle.top
-      && Math.abs(particle.y + particle.radius - obstacle.top) <= tolerance
-    ));
+    for (let i = 0; i < obstacles.length; i += 1) {
+      const obstacle = obstacles[i];
+      if (
+        particle.x + particle.radius > obstacle.left - tolerance
+        && particle.x - particle.radius < obstacle.right + tolerance
+        && particle.y <= obstacle.top
+        && Math.abs(particle.y + particle.radius - obstacle.top) <= tolerance
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  ensureGrid(particleCount) {
+    const gridW = Math.ceil(this.width / GRID_CELL) + 2;
+    const gridH = Math.ceil(this.height / GRID_CELL) + 2;
+    const cells = gridW * gridH;
+    if (!this.gridCellStart || this.gridCellStart.length < cells + 1) {
+      this.gridCellStart = new Int32Array(cells + 1);
+      this.gridCursor = new Int32Array(cells);
+    }
+    if (!this.gridEntries || this.gridEntries.length < particleCount) {
+      const capacity = Math.max(particleCount, 256);
+      this.gridEntries = new Int32Array(capacity);
+      this.gridCellOf = new Int32Array(capacity);
+    }
+    this.gridW = gridW;
+    this.gridH = gridH;
+    this.gridCells = cells;
+  }
+
+  fillGrid(active) {
+    const gridW = this.gridW;
+    const gridH = this.gridH;
+    const cells = this.gridCells;
+    const start = this.gridCellStart;
+    const cursor = this.gridCursor;
+    const entries = this.gridEntries;
+    const cellOf = this.gridCellOf;
+
+    start.fill(0, 0, cells + 1);
+    for (let i = 0; i < active.length; i += 1) {
+      const particle = active[i];
+      // The +1 border row/column on every side holds the slightly
+      // out-of-bounds cells a card ejection can produce; anything further out
+      // is unreachable in practice and clamped defensively (a false pair
+      // candidate is rejected by resolvePair's distance check anyway).
+      let cellX = Math.floor(particle.x / GRID_CELL) + 1;
+      let cellY = Math.floor(particle.y / GRID_CELL) + 1;
+      if (cellX < 0) cellX = 0;
+      else if (cellX >= gridW) cellX = gridW - 1;
+      if (cellY < 0) cellY = 0;
+      else if (cellY >= gridH) cellY = gridH - 1;
+      const cell = cellY * gridW + cellX;
+      cellOf[i] = cell;
+      start[cell + 1] += 1;
+    }
+    for (let cell = 0; cell < cells; cell += 1) start[cell + 1] += start[cell];
+    cursor.set(start.subarray(0, cells));
+    // Filling in ascending order keeps each bucket in particle-index order,
+    // matching the old push-based build — the sequential PBD solver's
+    // resolution order (and therefore settle positions) depends on it.
+    for (let i = 0; i < active.length; i += 1) {
+      entries[cursor[cellOf[i]]] = i;
+      cursor[cellOf[i]] += 1;
+    }
   }
 
   resolveCollisions(floor) {
-    const active = this.particles.filter((particle) => particle.released);
-    const cellSize = 18;
+    const active = this.activeParticles;
+    this.ensureGrid(active.length);
 
     // Re-solve both the floor and pair constraints several times. This lets a
     // resting impulse propagate through the full stack instead of allowing the
     // bottom row to be pushed through the floor and corrected next frame.
+    // The per-pass leading bounds sweep was a provable no-op straight after
+    // the previous pass's trailing one, so a single hoisted call replaces it;
+    // the leading card sweep stays (narrow mobile channels can re-wedge a
+    // wall-clamped glyph into a card between passes).
+    this.solveBounds(active, floor);
+
     for (let pass = 0; pass < 6; pass += 1) {
-      this.solveBounds(floor);
       this.solveCardCollisions(active);
-      const grid = new Map();
+      this.fillGrid(active);
+      const gridW = this.gridW;
+      const gridH = this.gridH;
+      const start = this.gridCellStart;
+      const entries = this.gridEntries;
 
-      active.forEach((particle, index) => {
-        const cellX = Math.floor(particle.x / cellSize);
-        const cellY = Math.floor(particle.y / cellSize);
-        const key = `${cellX},${cellY}`;
-        if (!grid.has(key)) grid.set(key, []);
-        grid.get(key).push(index);
-      });
-
-      active.forEach((a, indexA) => {
-        const cellX = Math.floor(a.x / cellSize);
-        const cellY = Math.floor(a.y / cellSize);
+      for (let indexA = 0; indexA < active.length; indexA += 1) {
+        const a = active[indexA];
+        const cellX = Math.floor(a.x / GRID_CELL) + 1;
+        const cellY = Math.floor(a.y / GRID_CELL) + 1;
 
         for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+          const rowY = cellY + offsetY;
+          if (rowY < 0 || rowY >= gridH) continue;
           for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
-            const bucket = grid.get(`${cellX + offsetX},${cellY + offsetY}`);
-            if (!bucket) continue;
-
-            bucket.forEach((indexB) => {
-              if (indexB <= indexA) return;
+            const colX = cellX + offsetX;
+            if (colX < 0 || colX >= gridW) continue;
+            const cell = rowY * gridW + colX;
+            for (let slot = start[cell]; slot < start[cell + 1]; slot += 1) {
+              const indexB = entries[slot];
+              if (indexB <= indexA) continue;
               this.resolvePair(a, active[indexB]);
-            });
+            }
           }
         }
-      });
+      }
 
       this.solveCardCollisions(active);
-      this.solveBounds(floor);
+      this.solveBounds(active, floor);
     }
 
-    this.updateSupportGraph(active, floor, cellSize);
+    this.updateSupportGraph(active, floor);
   }
 
-  updateSupportGraph(active, floor, cellSize) {
-    const adjacency = new Map();
-    const grid = new Map();
-    const queue = [];
-    const reached = new Set();
+  ensureSupportBuffers(count) {
+    if (!this.adjacencyHead || this.adjacencyHead.length < count) {
+      const capacity = Math.max(count, 256);
+      this.adjacencyHead = new Int32Array(capacity);
+      this.reachedFlags = new Uint8Array(capacity);
+      this.supportQueue = new Int32Array(capacity);
+    }
+    if (!this.edgeTo) {
+      const capacity = Math.max(count * 8, 1024);
+      this.edgeTo = new Int32Array(capacity);
+      this.edgeNext = new Int32Array(capacity);
+    }
+  }
 
-    active.forEach((particle, index) => {
+  growEdgeBuffers() {
+    const nextTo = new Int32Array(this.edgeTo.length * 2);
+    nextTo.set(this.edgeTo);
+    this.edgeTo = nextTo;
+    const nextNext = new Int32Array(this.edgeNext.length * 2);
+    nextNext.set(this.edgeNext);
+    this.edgeNext = nextNext;
+  }
+
+  updateSupportGraph(active, floor) {
+    const count = active.length;
+    this.ensureSupportBuffers(count);
+    // Support/sleep classification must see post-solve positions, so the grid
+    // is refilled once more after the final pass moved particles.
+    this.fillGrid(active);
+
+    const adjacencyHead = this.adjacencyHead;
+    const reached = this.reachedFlags;
+    const queue = this.supportQueue;
+    let queueTail = 0;
+
+    for (let i = 0; i < count; i += 1) {
+      const particle = active[i];
       particle.supported = false;
-      adjacency.set(particle, []);
-
-      const cellX = Math.floor(particle.x / cellSize);
-      const cellY = Math.floor(particle.y / cellSize);
-      const key = `${cellX},${cellY}`;
-      if (!grid.has(key)) grid.set(key, []);
-      grid.get(key).push(index);
+      adjacencyHead[i] = -1;
+      reached[i] = 0;
 
       const supportedByCard = !particle.dragging && this.isSupportedByCard(particle);
       particle.obstacleSupported = supportedByCard;
 
       if (!particle.dragging && (particle.y + particle.radius >= floor - 0.35 || supportedByCard)) {
-        reached.add(particle);
-        queue.push(particle);
+        reached[i] = 1;
+        queue[queueTail] = i;
+        queueTail += 1;
         particle.grounded = particle.y + particle.radius >= floor - 0.35;
       }
-    });
+    }
 
-    active.forEach((a, indexA) => {
-      const cellX = Math.floor(a.x / cellSize);
-      const cellY = Math.floor(a.y / cellSize);
+    const gridW = this.gridW;
+    const gridH = this.gridH;
+    const start = this.gridCellStart;
+    const entries = this.gridEntries;
+    let edgeCount = 0;
+
+    for (let indexA = 0; indexA < count; indexA += 1) {
+      const a = active[indexA];
+      const cellX = Math.floor(a.x / GRID_CELL) + 1;
+      const cellY = Math.floor(a.y / GRID_CELL) + 1;
 
       for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
+        const rowY = cellY + offsetY;
+        if (rowY < 0 || rowY >= gridH) continue;
         for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
-          const bucket = grid.get(`${cellX + offsetX},${cellY + offsetY}`);
-          if (!bucket) continue;
-
-          bucket.forEach((indexB) => {
-            if (indexB <= indexA) return;
+          const colX = cellX + offsetX;
+          if (colX < 0 || colX >= gridW) continue;
+          const cell = rowY * gridW + colX;
+          for (let slot = start[cell]; slot < start[cell + 1]; slot += 1) {
+            const indexB = entries[slot];
+            if (indexB <= indexA) continue;
             const b = active[indexB];
             const dx = b.x - a.x;
             const dy = b.y - a.y;
             const contactDistance = a.radius + b.radius + 0.35;
             const distanceSquared = dx * dx + dy * dy;
-            if (distanceSquared > contactDistance * contactDistance || distanceSquared < 0.0001) return;
+            if (distanceSquared > contactDistance * contactDistance || distanceSquared < 0.0001) continue;
 
             const ny = dy / Math.sqrt(distanceSquared);
-            if (ny > 0.32 && !b.dragging) adjacency.get(b).push(a);
-            if (ny < -0.32 && !a.dragging) adjacency.get(a).push(b);
-          });
+            if (edgeCount + 2 > this.edgeTo.length) this.growEdgeBuffers();
+            if (ny > 0.32 && !b.dragging) {
+              // b sits below a: an edge from the supporter up to the supported.
+              this.edgeTo[edgeCount] = indexA;
+              this.edgeNext[edgeCount] = adjacencyHead[indexB];
+              adjacencyHead[indexB] = edgeCount;
+              edgeCount += 1;
+            }
+            if (ny < -0.32 && !a.dragging) {
+              this.edgeTo[edgeCount] = indexB;
+              this.edgeNext[edgeCount] = adjacencyHead[indexA];
+              adjacencyHead[indexA] = edgeCount;
+              edgeCount += 1;
+            }
+          }
         }
       }
-    });
-
-    while (queue.length) {
-      const lower = queue.shift();
-      adjacency.get(lower).forEach((upper) => {
-        if (reached.has(upper)) return;
-        reached.add(upper);
-        queue.push(upper);
-      });
     }
 
-    active.forEach((particle) => {
-      particle.supported = reached.has(particle);
+    const edgeTo = this.edgeTo;
+    const edgeNext = this.edgeNext;
+    let queueHead = 0;
+    while (queueHead < queueTail) {
+      const lower = queue[queueHead];
+      queueHead += 1;
+      for (let edge = adjacencyHead[lower]; edge !== -1; edge = edgeNext[edge]) {
+        const upper = edgeTo[edge];
+        if (reached[upper]) continue;
+        reached[upper] = 1;
+        queue[queueTail] = upper;
+        queueTail += 1;
+      }
+    }
+
+    for (let i = 0; i < count; i += 1) {
+      const particle = active[i];
+      particle.supported = reached[i] === 1;
       if (particle.sleeping && !particle.supported) {
         particle.sleeping = false;
         particle.sleepTimer = 0;
         particle.energyAverage = 0;
       }
-    });
+    }
   }
 
   resolvePair(a, b) {
@@ -1191,9 +1577,11 @@ class GlyphPhysics {
     const gravity = 1450;
     const slidingCoefficient = 0.18;
     const rollingCoefficient = 0.014;
+    const particles = this.particles;
 
-    this.particles.forEach((particle) => {
-      if (!particle.released || particle.dragging || particle.sleeping || !particle.supported) return;
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released || particle.dragging || particle.sleeping || !particle.supported) continue;
 
       // Coulomb sliding friction and rolling resistance are driven by the
       // normal load (m*g). Rotation therefore loses energy because the glyph
@@ -1203,12 +1591,14 @@ class GlyphPhysics {
       particle.vx = Math.sign(particle.vx) * Math.max(0, Math.abs(particle.vx) - linearLoss);
       particle.angularVelocity = Math.sign(particle.angularVelocity)
         * Math.max(0, Math.abs(particle.angularVelocity) - angularLoss);
-    });
+    }
   }
 
   updateSleeping(dt) {
-    this.particles.forEach((particle) => {
-      if (!particle.released || particle.dragging || particle.sleeping) return;
+    const particles = this.particles;
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released || particle.dragging || particle.sleeping) continue;
       const kineticEnergy = 0.5 * (particle.vx * particle.vx + particle.vy * particle.vy)
         + 0.25 * (particle.radius * particle.angularVelocity) ** 2;
       const energyBlend = 1 - Math.exp(-dt / 0.12);
@@ -1228,16 +1618,22 @@ class GlyphPhysics {
       } else {
         particle.sleepTimer = 0;
       }
-    });
+    }
   }
 
   stepReturning(dt) {
     const spring = 240;
     const damping = 29;
     let allHome = true;
+    const particles = this.particles;
 
-    this.particles.forEach((particle) => {
-      if (!particle.released) return;
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released) continue;
+
+      particle.previousX = particle.x;
+      particle.previousY = particle.y;
+      particle.previousAngle = particle.angle;
 
       const dx = particle.homeX - particle.x;
       const dy = particle.homeY - particle.y;
@@ -1255,7 +1651,7 @@ class GlyphPhysics {
       if (Math.hypot(dx, dy) > 0.55 || Math.hypot(particle.vx, particle.vy) > 3 || Math.abs(particle.angle) > 0.015) {
         allHome = false;
       }
-    });
+    }
 
     this.returnStableFrames = allHome ? this.returnStableFrames + 1 : 0;
   }
@@ -1276,6 +1672,7 @@ class GlyphPhysics {
       particle.element.classList.remove("released");
     });
 
+    this.activeParticles = [];
     this.mode = "intact";
     this.releaseAmount = 0;
     this.returnStableFrames = 0;
@@ -1290,31 +1687,107 @@ class GlyphPhysics {
     window.setTimeout(() => this.clearCanvas(), 120);
   }
 
+  spriteFor(particle) {
+    const key = `${particle.font}|${particle.color}|${particle.glyph}`;
+    let sprite = this.spriteAtlas.get(key);
+    if (!sprite) {
+      sprite = this.buildSprite(particle);
+      this.spriteAtlas.set(key, sprite);
+    }
+    return sprite;
+  }
+
+  buildSprite(particle) {
+    // Rasterized at >= 2x so glyphs resting at a permanent angle stay crisp
+    // even on dpr-1 displays. The em-box overshoot of block/box-drawing glyphs
+    // is covered by actual bounding-box metrics plus padding.
+    const scale = Math.max(2, this.dpr);
+    const nudge = particle.fontSize * 0.04;
+    const scratch = this.spriteScratch
+      || (this.spriteScratch = document.createElement("canvas").getContext("2d"));
+    scratch.font = particle.font;
+    scratch.textAlign = "center";
+    scratch.textBaseline = "middle";
+
+    const metrics = scratch.measureText(particle.glyph);
+    const fallback = particle.fontSize * 0.8;
+    const left = Number.isFinite(metrics.actualBoundingBoxLeft) ? metrics.actualBoundingBoxLeft : fallback;
+    const right = Number.isFinite(metrics.actualBoundingBoxRight) ? metrics.actualBoundingBoxRight : fallback;
+    const ascent = Number.isFinite(metrics.actualBoundingBoxAscent) ? metrics.actualBoundingBoxAscent : fallback;
+    const descent = Number.isFinite(metrics.actualBoundingBoxDescent) ? metrics.actualBoundingBoxDescent : fallback;
+
+    const padding = 2;
+    const width = left + right + padding * 2;
+    const height = ascent + descent + padding * 2;
+    // The anchor is the particle-local origin (its rotation center); the
+    // fontSize * 0.04 baseline nudge of the old fillText call is baked in.
+    const anchorX = left + padding;
+    const anchorY = ascent + padding - nudge;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.ceil(width * scale));
+    canvas.height = Math.max(1, Math.ceil(height * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+    ctx.font = particle.font;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = particle.color;
+    ctx.fillText(particle.glyph, anchorX, anchorY + nudge);
+
+    return { canvas, width, height, anchorX, anchorY };
+  }
+
   draw() {
     this.clearCanvas();
     if (this.mode === "intact") return;
 
-    this.ctx.textAlign = "center";
-    this.ctx.textBaseline = "middle";
+    const ctx = this.ctx;
+    const dpr = this.dpr;
+    const particles = this.particles;
+    // Render between the last two substeps: the leftover accumulator is the
+    // fraction of a substep the display sits past the previous sim state.
+    // Raw post-substep positions would lurch whenever the per-frame substep
+    // count alternates (2/1/3 at 60Hz, 0/2 beats at 120Hz).
+    const blend = Math.min(this.accumulator / FIXED_STEP, 1);
+    let lastAlpha = 1;
+    ctx.globalAlpha = 1;
 
-    this.particles.forEach((particle) => {
-      if (!particle.released) return;
-      this.ctx.save();
-      this.ctx.translate(particle.x, particle.y);
-      this.ctx.rotate(particle.angle);
-      this.ctx.fillStyle = particle.color;
-      this.ctx.globalAlpha = particle.alpha;
-      this.ctx.font = particle.font;
-      this.ctx.fillText(particle.glyph, 0, particle.fontSize * 0.04);
-      this.ctx.restore();
-    });
+    for (let i = 0; i < particles.length; i += 1) {
+      const particle = particles[i];
+      if (!particle.released) continue;
+
+      const sprite = particle.sprite || (particle.sprite = this.spriteFor(particle));
+      let x = particle.x;
+      let y = particle.y;
+      let angle = particle.angle;
+      if (!particle.dragging) {
+        x = particle.previousX + (x - particle.previousX) * blend;
+        y = particle.previousY + (y - particle.previousY) * blend;
+        angle = particle.previousAngle + (angle - particle.previousAngle) * blend;
+      }
+
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      ctx.setTransform(dpr * cos, dpr * sin, -dpr * sin, dpr * cos, x * dpr, y * dpr);
+      if (particle.alpha !== lastAlpha) {
+        ctx.globalAlpha = particle.alpha;
+        lastAlpha = particle.alpha;
+      }
+      ctx.drawImage(sprite.canvas, -sprite.anchorX, -sprite.anchorY, sprite.width, sprite.height);
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
   }
 
   clearCanvas() {
-    this.ctx.save();
-    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-    this.ctx.restore();
+    // Self-contained: finishReturn() schedules this standalone, so it must
+    // leave the base dpr transform in place when it exits.
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
   }
 
   pointFromEvent(event) {
@@ -1390,6 +1863,11 @@ class GlyphPhysics {
     this.dragged.sleepTimer = 0;
     this.dragged.energyAverage = 0;
     this.dragged.supported = false;
+    // The pointer moved this particle between substeps; re-sync the
+    // interpolation snapshot so the render doesn't pop back one frame.
+    this.dragged.previousX = this.dragged.x;
+    this.dragged.previousY = this.dragged.y;
+    this.dragged.previousAngle = this.dragged.angle;
 
     if (this.canvas.hasPointerCapture(event.pointerId)) {
       this.canvas.releasePointerCapture(event.pointerId);
