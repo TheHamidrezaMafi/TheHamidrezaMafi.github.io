@@ -493,12 +493,27 @@ class GlyphPhysics {
     this.maxHeightQuery = window.matchMedia("(max-height: 600px)");
     this.lastMaxHeightMatch = this.maxHeightQuery.matches;
 
+    // Device-tilt gravity. The unit vector is in page coordinates (x right,
+    // y down); strength scales toward 0 as the phone approaches lying flat,
+    // where the screen plane holds no gravity. Defaults reproduce the
+    // original straight-down behavior exactly until a sensor sample arrives.
+    this.gravityUnitX = 0;
+    this.gravityUnitY = 1;
+    this.gravityStrength = 1;
+    this.gravityActive = false;
+    this.appliedGravityUnitX = 0;
+    this.appliedGravityUnitY = 1;
+    this.appliedGravityStrength = 1;
+    this.motionPermissionRequested = false;
+    this.fullReleaseSince = 0;
+
     this.tick = this.tick.bind(this);
     this.handleScroll = this.handleScroll.bind(this);
     this.handleResize = this.handleResize.bind(this);
     this.handlePointerDown = this.handlePointerDown.bind(this);
     this.handlePointerMove = this.handlePointerMove.bind(this);
     this.handlePointerUp = this.handlePointerUp.bind(this);
+    this.handleDeviceOrientation = this.handleDeviceOrientation.bind(this);
   }
 
   async init() {
@@ -538,6 +553,113 @@ class GlyphPhysics {
         this.startLoop();
       }
     });
+
+    this.setupGravitySensor();
+  }
+
+  setupGravitySensor() {
+    if (this.reducedMotion || !("DeviceOrientationEvent" in window)) return;
+
+    const attach = () => {
+      window.addEventListener("deviceorientation", this.handleDeviceOrientation, { passive: true });
+    };
+
+    if (typeof DeviceOrientationEvent.requestPermission === "function") {
+      // iOS: the permission prompt must come from a user gesture, so the
+      // first touch on the page asks once. Denial silently keeps the
+      // default straight-down gravity.
+      const request = () => {
+        if (this.motionPermissionRequested) return;
+        this.motionPermissionRequested = true;
+        window.removeEventListener("touchend", request);
+        this.stage.removeEventListener("pointerdown", request);
+        DeviceOrientationEvent.requestPermission()
+          .then((state) => {
+            if (state === "granted") attach();
+          })
+          .catch(() => {});
+      };
+      window.addEventListener("touchend", request, { passive: true });
+      this.stage.addEventListener("pointerdown", request, { passive: true });
+    } else {
+      attach();
+    }
+  }
+
+  handleDeviceOrientation(event) {
+    const beta = event.beta;
+    const gamma = event.gamma;
+    if (beta == null || gamma == null) return;
+
+    // Screen-plane gravity in the device's natural (portrait) page frame,
+    // in units of g. Derived from the spec's Z-X'-Y'' intrinsic rotations:
+    // gravity_device = (sin(gamma)cos(beta), -sin(beta), -cos(gamma)cos(beta)),
+    // then mapped to page coordinates (x right, y down = -device y).
+    const betaRad = beta * (Math.PI / 180);
+    const gammaRad = gamma * (Math.PI / 180);
+    const portraitX = Math.sin(gammaRad) * Math.cos(betaRad);
+    const portraitY = Math.sin(betaRad);
+
+    // Rotate into the current screen orientation. angle=90 corresponds to
+    // the device turned clockwise (content rotated counterclockwise), which
+    // maps page vectors by a +angle rotation.
+    const orientationDegrees = screen.orientation && typeof screen.orientation.angle === "number"
+      ? screen.orientation.angle
+      : Number(window.orientation) || 0;
+    const orientation = orientationDegrees * (Math.PI / 180);
+    const cos = Math.cos(orientation);
+    const sin = Math.sin(orientation);
+    const planarX = portraitX * cos - portraitY * sin;
+    const planarY = portraitX * sin + portraitY * cos;
+
+    // A flat phone has no in-plane gravity: fade strength out instead of
+    // chasing an unstable direction. Full strength from ~30 degrees of tilt.
+    const planarMagnitude = Math.hypot(planarX, planarY);
+    const targetStrength = clamp(planarMagnitude / 0.5, 0, 1);
+    let targetUnitX = this.gravityUnitX;
+    let targetUnitY = this.gravityUnitY;
+    if (planarMagnitude > 0.08) {
+      targetUnitX = planarX / planarMagnitude;
+      targetUnitY = planarY / planarMagnitude;
+    }
+
+    const blend = 0.25;
+    let unitX = this.gravityUnitX + (targetUnitX - this.gravityUnitX) * blend;
+    let unitY = this.gravityUnitY + (targetUnitY - this.gravityUnitY) * blend;
+    const norm = Math.hypot(unitX, unitY);
+    if (norm > 0.0001) {
+      unitX /= norm;
+      unitY /= norm;
+    } else {
+      unitX = targetUnitX;
+      unitY = targetUnitY;
+    }
+    this.gravityUnitX = unitX;
+    this.gravityUnitY = unitY;
+    this.gravityStrength += (targetStrength - this.gravityStrength) * blend;
+    this.gravityActive = true;
+
+    // A meaningful swing in direction or strength has to wake sleeping
+    // glyphs and restart the loop — a settled pile must not stay glued
+    // mid-air when the floor effectively moves.
+    if (this.mode !== "falling") return;
+    const alignment = unitX * this.appliedGravityUnitX + unitY * this.appliedGravityUnitY;
+    const strengthShift = Math.abs(this.gravityStrength - this.appliedGravityStrength);
+    if (alignment < 0.985 || strengthShift > 0.12) {
+      this.appliedGravityUnitX = unitX;
+      this.appliedGravityUnitY = unitY;
+      this.appliedGravityStrength = this.gravityStrength;
+      const particles = this.particles;
+      for (let i = 0; i < particles.length; i += 1) {
+        const particle = particles[i];
+        if (!particle.released || !particle.sleeping) continue;
+        particle.sleeping = false;
+        particle.sleepTimer = 0;
+        particle.energyAverage = 0;
+      }
+      this.allSleepingFrames = 0;
+      this.startLoop();
+    }
   }
 
   handleResize() {
@@ -972,18 +1094,56 @@ class GlyphPhysics {
   }
 
   maybeActivateProjectDeck(startLoop) {
-    if (projectDeckReady || this.mode !== "falling" || this.progress < this.projectRevealProgress) return;
+    if (projectDeckReady || this.mode !== "falling" || this.progress < this.projectRevealProgress) {
+      this.fullReleaseSince = 0;
+      return;
+    }
     const active = this.activeParticles;
-    if (!active.length || active.length !== this.particles.length) return;
+    if (!active.length || active.length !== this.particles.length) {
+      this.fullReleaseSince = 0;
+      return;
+    }
+    if (!this.fullReleaseSince) this.fullReleaseSince = performance.now();
 
     const potentialObstacles = this.readCardObstacles();
     if (!potentialObstacles.length) return;
-    const clearanceY = Math.max(...potentialObstacles.map((obstacle) => obstacle.bottom)) + 3;
-    const cleared = active.filter((particle) => particle.y - particle.radius >= clearanceY).length;
 
-    // Reveal only after the fall has genuinely cleared the card area. A tiny
-    // tolerance keeps one late bouncing glyph from withholding the whole deck.
-    if (cleared / active.length < 0.94) return;
+    if (this.gravityActive) {
+      // Tilted gravity can pile glyphs anywhere, so "fell past the cards"
+      // stops being meaningful. Reveal once the card area itself is clear —
+      // or after a grace period, since activateProjectDeck projects any
+      // overlapping glyphs out gently anyway.
+      if (performance.now() - this.fullReleaseSince < 2500) {
+        let cleared = 0;
+        for (let i = 0; i < active.length; i += 1) {
+          const particle = active[i];
+          let outside = true;
+          for (let j = 0; j < potentialObstacles.length; j += 1) {
+            const obstacle = potentialObstacles[j];
+            const margin = particle.radius + 3;
+            if (
+              particle.x > obstacle.left - margin
+              && particle.x < obstacle.right + margin
+              && particle.y > obstacle.top - margin
+              && particle.y < obstacle.bottom + margin
+            ) {
+              outside = false;
+              break;
+            }
+          }
+          if (outside) cleared += 1;
+        }
+        if (cleared / active.length < 0.94) return;
+      }
+    } else {
+      const clearanceY = Math.max(...potentialObstacles.map((obstacle) => obstacle.bottom)) + 3;
+      const cleared = active.filter((particle) => particle.y - particle.radius >= clearanceY).length;
+
+      // Reveal only after the fall has genuinely cleared the card area. A tiny
+      // tolerance keeps one late bouncing glyph from withholding the whole deck.
+      if (cleared / active.length < 0.94) return;
+    }
+
     this.activateProjectDeck(startLoop);
   }
 
@@ -1029,6 +1189,7 @@ class GlyphPhysics {
   beginReturn() {
     if (this.mode === "returning") return;
     this.deactivateProjectDeck(false);
+    this.fullReleaseSince = 0;
     this.mode = "returning";
     this.stage.classList.add("returning");
     this.returnStableFrames = 0;
@@ -1058,7 +1219,11 @@ class GlyphPhysics {
       particle.sleepTimer = 0;
       particle.energyAverage = 0;
       particle.supported = false;
-      particle.vy += lerp(10, 55, seeded(particle.index, 10));
+      // The nudge falls along the current gravity direction (straight down
+      // by default).
+      const kick = lerp(10, 55, seeded(particle.index, 10));
+      particle.vx += kick * this.gravityUnitX;
+      particle.vy += kick * this.gravityUnitY;
     });
     this.startLoop();
   }
@@ -1134,6 +1299,8 @@ class GlyphPhysics {
     const linearAirRetention = Math.exp(-0.2 * dt);
     const angularAirRetention = Math.exp(-0.28 * dt);
     const particles = this.particles;
+    const gravityX = gravity * this.gravityStrength * this.gravityUnitX;
+    const gravityY = gravity * this.gravityStrength * this.gravityUnitY;
 
     for (let i = 0; i < particles.length; i += 1) {
       const particle = particles[i];
@@ -1149,7 +1316,8 @@ class GlyphPhysics {
 
       if (!particle.released || particle.dragging || particle.sleeping) continue;
 
-      particle.vy += gravity * dt;
+      particle.vx += gravityX * dt;
+      particle.vy += gravityY * dt;
       particle.vx *= linearAirRetention;
       particle.vy *= linearAirRetention;
       particle.angularVelocity *= angularAirRetention;
@@ -1176,24 +1344,35 @@ class GlyphPhysics {
   }
 
   solveBounds(active, floor) {
+    // A wall supports a particle only when gravity presses it into that wall.
+    // With the default (0, 1) gravity this reduces exactly to the original
+    // floor-only behavior.
+    const leftSupports = this.gravityUnitX < -0.3;
+    const rightSupports = this.gravityUnitX > 0.3;
+    const floorSupports = this.gravityUnitY > 0.3;
+    const ceilingSupports = this.gravityUnitY < -0.3;
+
     for (let i = 0; i < active.length; i += 1) {
       const particle = active[i];
       if (particle.dragging) continue;
 
       if (particle.x - particle.radius < 0) {
         particle.x = particle.radius;
+        if (leftSupports) particle.supported = true;
       } else if (particle.x + particle.radius > this.width) {
         particle.x = this.width - particle.radius;
+        if (rightSupports) particle.supported = true;
       }
 
       if (particle.y + particle.radius > floor) {
         particle.y = floor - particle.radius;
         particle.grounded = true;
-        particle.supported = true;
+        if (floorSupports) particle.supported = true;
       }
 
       if (particle.y - particle.radius < 0) {
         particle.y = particle.radius;
+        if (ceilingSupports) particle.supported = true;
       }
     }
   }
@@ -1271,16 +1450,37 @@ class GlyphPhysics {
     const obstacles = this.cardObstacles;
     if (!obstacles.length) return false;
     const tolerance = 0.72;
+
+    if (!this.gravityActive) {
+      // Original exact model: resting on a card's top edge.
+      for (let i = 0; i < obstacles.length; i += 1) {
+        const obstacle = obstacles[i];
+        if (
+          particle.x + particle.radius > obstacle.left - tolerance
+          && particle.x - particle.radius < obstacle.right + tolerance
+          && particle.y <= obstacle.top
+          && Math.abs(particle.y + particle.radius - obstacle.top) <= tolerance
+        ) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Tilt mode: a card supports the particle when the contact normal at the
+    // closest point opposes gravity — any card face can be a floor.
     for (let i = 0; i < obstacles.length; i += 1) {
       const obstacle = obstacles[i];
-      if (
-        particle.x + particle.radius > obstacle.left - tolerance
-        && particle.x - particle.radius < obstacle.right + tolerance
-        && particle.y <= obstacle.top
-        && Math.abs(particle.y + particle.radius - obstacle.top) <= tolerance
-      ) {
-        return true;
-      }
+      const closestX = clamp(particle.x, obstacle.left, obstacle.right);
+      const closestY = clamp(particle.y, obstacle.top, obstacle.bottom);
+      const dx = particle.x - closestX;
+      const dy = particle.y - closestY;
+      const distanceSquared = dx * dx + dy * dy;
+      if (distanceSquared < 0.000001) continue;
+      const distance = Math.sqrt(distanceSquared);
+      if (distance > particle.radius + tolerance) continue;
+      const normalAlignment = (dx * this.gravityUnitX + dy * this.gravityUnitY) / distance;
+      if (normalAlignment < -0.45) return true;
     }
     return false;
   }
@@ -1422,6 +1622,12 @@ class GlyphPhysics {
     const adjacencyHead = this.adjacencyHead;
     const reached = this.reachedFlags;
     const queue = this.supportQueue;
+    const unitX = this.gravityUnitX;
+    const unitY = this.gravityUnitY;
+    const leftSupports = unitX < -0.3;
+    const rightSupports = unitX > 0.3;
+    const floorSupports = unitY > 0.3;
+    const ceilingSupports = unitY < -0.3;
     let queueTail = 0;
 
     for (let i = 0; i < count; i += 1) {
@@ -1433,11 +1639,19 @@ class GlyphPhysics {
       const supportedByCard = !particle.dragging && this.isSupportedByCard(particle);
       particle.obstacleSupported = supportedByCard;
 
-      if (!particle.dragging && (particle.y + particle.radius >= floor - 0.35 || supportedByCard)) {
+      // Seed the BFS from every boundary gravity presses particles into —
+      // with default gravity that is the floor alone, exactly as before.
+      const nearFloor = particle.y + particle.radius >= floor - 0.35;
+      const pressedIntoWall = (floorSupports && nearFloor)
+        || (ceilingSupports && particle.y - particle.radius <= 0.35)
+        || (leftSupports && particle.x - particle.radius <= 0.35)
+        || (rightSupports && particle.x + particle.radius >= this.width - 0.35);
+
+      if (!particle.dragging && (pressedIntoWall || supportedByCard)) {
         reached[i] = 1;
         queue[queueTail] = i;
         queueTail += 1;
-        particle.grounded = particle.y + particle.radius >= floor - 0.35;
+        particle.grounded = nearFloor;
       }
     }
 
@@ -1469,16 +1683,19 @@ class GlyphPhysics {
             const distanceSquared = dx * dx + dy * dy;
             if (distanceSquared > contactDistance * contactDistance || distanceSquared < 0.0001) continue;
 
-            const ny = dy / Math.sqrt(distanceSquared);
+            // "Below" means along the gravity direction; with default (0, 1)
+            // gravity this is exactly the old ny test.
+            const distance = Math.sqrt(distanceSquared);
+            const alongGravity = (dx * unitX + dy * unitY) / distance;
             if (edgeCount + 2 > this.edgeTo.length) this.growEdgeBuffers();
-            if (ny > 0.32 && !b.dragging) {
+            if (alongGravity > 0.32 && !b.dragging) {
               // b sits below a: an edge from the supporter up to the supported.
               this.edgeTo[edgeCount] = indexA;
               this.edgeNext[edgeCount] = adjacencyHead[indexB];
               adjacencyHead[indexB] = edgeCount;
               edgeCount += 1;
             }
-            if (ny < -0.32 && !a.dragging) {
+            if (alongGravity < -0.32 && !a.dragging) {
               this.edgeTo[edgeCount] = indexB;
               this.edgeNext[edgeCount] = adjacencyHead[indexA];
               adjacencyHead[indexA] = edgeCount;
@@ -1543,8 +1760,11 @@ class GlyphPhysics {
     a.contactCount = (a.contactCount || 0) + 1;
     b.contactCount = (b.contactCount || 0) + 1;
 
-    if (ny > 0.28) a.supported = true;
-    if (ny < -0.28) b.supported = true;
+    // Projection of the contact normal onto gravity: with default (0, 1)
+    // gravity this is exactly the old ny test.
+    const gravityAlignment = nx * this.gravityUnitX + ny * this.gravityUnitY;
+    if (gravityAlignment > 0.28) a.supported = true;
+    if (gravityAlignment < -0.28) b.supported = true;
 
     // Sleeping bodies behave like a stable support until a real impact or a
     // direct pointer interaction contributes enough energy to wake them.
@@ -1579,6 +1799,12 @@ class GlyphPhysics {
     const rollingCoefficient = 0.014;
     const particles = this.particles;
 
+    // Sliding friction acts along the tangent of the gravity direction; with
+    // default (0, 1) gravity the tangent is the x axis and this is exactly
+    // the original vx-only reduction.
+    const tangentX = -this.gravityUnitY;
+    const tangentY = this.gravityUnitX;
+
     for (let i = 0; i < particles.length; i += 1) {
       const particle = particles[i];
       if (!particle.released || particle.dragging || particle.sleeping || !particle.supported) continue;
@@ -1588,7 +1814,11 @@ class GlyphPhysics {
       // is under gravity and in contact—not because a timer expired.
       const linearLoss = slidingCoefficient * gravity * dt;
       const angularLoss = (2 * rollingCoefficient * gravity / particle.radius) * dt;
-      particle.vx = Math.sign(particle.vx) * Math.max(0, Math.abs(particle.vx) - linearLoss);
+      const tangentSpeed = particle.vx * tangentX + particle.vy * tangentY;
+      const reducedSpeed = Math.sign(tangentSpeed) * Math.max(0, Math.abs(tangentSpeed) - linearLoss);
+      const speedDelta = reducedSpeed - tangentSpeed;
+      particle.vx += speedDelta * tangentX;
+      particle.vy += speedDelta * tangentY;
       particle.angularVelocity = Math.sign(particle.angularVelocity)
         * Math.max(0, Math.abs(particle.angularVelocity) - angularLoss);
     }
@@ -1606,8 +1836,10 @@ class GlyphPhysics {
 
       // This is energy-based sleeping, not a deadline. A glyph can sleep only
       // while physically supported and continuously below the kinetic-energy
-      // threshold. Any sufficiently energetic impact wakes it again.
-      if (particle.supported && particle.energyAverage < 4.5) {
+      // threshold. Any sufficiently energetic impact wakes it again. A
+      // near-flat phone (gravity fading to zero) has nothing to fall toward,
+      // so stationary glyphs may sleep unsupported instead of idling forever.
+      if ((particle.supported || this.gravityStrength < 0.3) && particle.energyAverage < 4.5) {
         particle.sleepTimer += dt;
         if (particle.sleepTimer >= 0.38) {
           particle.sleeping = true;
@@ -1673,6 +1905,7 @@ class GlyphPhysics {
     });
 
     this.activeParticles = [];
+    this.fullReleaseSince = 0;
     this.mode = "intact";
     this.releaseAmount = 0;
     this.returnStableFrames = 0;
